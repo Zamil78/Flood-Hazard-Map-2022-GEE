@@ -1,0 +1,127 @@
+// Load necessary images and collections
+var srtm = ee.Image("USGS/SRTMGL1_003");
+var l8 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2");
+var gsw = ee.Image("JRC/GSW1_4/GlobalSurfaceWater");
+
+// Define the study area (roi) - Khulna City, Bangladesh
+var roi = ee.Geometry.Polygon(
+  [[89.46952954285888, 22.906112893688267],
+  [89.46609631531982, 22.755494641623073],
+  [89.63913098328857, 22.74789603406306],
+  [89.62059155457763, 22.90484788916685]]);
+
+// Cloud mask function for Landsat 8
+function cloudMask(image){
+  var qa = image.select('QA_PIXEL');
+  var dilated = 1 << 1;
+  var cirrus = 1 << 2;
+  var cloud = 1 << 3;
+  var shadow = 1 << 4;
+  var mask = qa.bitwiseAnd(dilated).eq(0)
+    .and(qa.bitwiseAnd(cirrus).eq(0))
+    .and(qa.bitwiseAnd(cloud).eq(0))
+    .and(qa.bitwiseAnd(shadow).eq(0));
+  return image.select(['SR_B.*'], ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7']).multiply(0.0000275).add(-0.2).updateMask(mask);
+}
+
+// Load water occurrence data and visualize
+var water = gsw.select('occurrence').clip(roi);
+Map.addLayer(water, { min: 0, max: 100, palette: ['white', 'cyan', 'blue' ]}, 'Water');
+
+// Permanent water
+var permanent = water.gt(80);
+Map.addLayer(permanent.selfMask(), { palette: 'blue' }, 'Permanent Water');
+
+// Define rainbow palette for hazard scores
+var rainbow = ['blue', 'cyan', 'green', 'yellow', 'red'];
+
+// Distance from water
+var distance = permanent.fastDistanceTransform().divide(30).clip(roi).reproject('EPSG:4326', null, 30);
+Map.addLayer(distance, { max: 0, min: 5000, palette: rainbow}, 'Distance');
+
+// Only the distance without permanent water
+var onlyDistance = distance.updateMask(distance.neq(0).and(srtm.mask()));
+Map.addLayer(onlyDistance, { min: 0, max: 5000, palette: rainbow}, 'Distance from permanent water');
+
+// Calculate hazard scores based on distance
+var distanceScore = onlyDistance.where(onlyDistance.gt(2500), 1)
+  .where(onlyDistance.gt(2000).and(onlyDistance.lte(2500)), 2)
+  .where(onlyDistance.gt(1500).and(onlyDistance.lte(2000)), 3)
+  .where(onlyDistance.gt(1000).and(onlyDistance.lte(1500)), 4)
+  .where(onlyDistance.lte(1000), 5);
+Map.addLayer(distanceScore, { min: 1, max: 5, palette: rainbow }, 'Distance hazard score');
+
+// Elevation data
+var elevation = srtm.clip(roi);
+Map.addLayer(elevation, { min: 0, max: 100, palette: ['green', 'yellow', 'red', 'white'] }, 'DEM');
+
+// Calculate hazard scores based on elevation
+var elevScore = elevation.updateMask(distance.neq(0)).where(elevation.gt(15), 1)
+  .where(elevation.gt(10).and(elevation.lte(15)), 2)
+  .where(elevation.gt(6).and(elevation.lte(10)), 3)
+  .where(elevation.gt(2).and(elevation.lte(6)), 4)
+  .where(elevation.lte(2), 5);
+Map.addLayer(elevScore, { min: 1, max: 5, palette: rainbow }, 'Elevation hazard score');
+
+// Create topographic position index
+var tpi = elevation.subtract(elevation.focalMean(5).reproject('EPSG:4326', null, 30)).rename('TPI');
+Map.addLayer(tpi, { min: -5, max: 5, palette: ['blue', 'yellow', 'red'] }, 'TPI');
+
+// Calculate hazard scores based on topography
+var topoScore = tpi.updateMask(distance.neq(0)).where(tpi.gt(0), 1)
+  .where(tpi.gt(-2).and(tpi.lte(0)), 2)
+  .where(tpi.gt(-4).and(tpi.lte(-2)), 3)
+  .where(tpi.gt(-6).and(tpi.lte(-4)), 4)
+  .where(tpi.lte(-8), 5);
+Map.addLayer(topoScore, { min: 1, max: 5, palette: rainbow }, 'Topographic hazard score');
+
+// Load Landsat 8 data and calculate NDVI and NDWI
+var landsat8 = l8.filterBounds(roi).filterDate('2022-01-01', '2022-12-31').map(cloudMask).median().clip(roi);
+var bandMap = {
+  RED: landsat8.select('B4'),
+  NIR: landsat8.select('B5'),
+  GREEN: landsat8.select('B3'),
+};
+var ndvi = landsat8.expression('(NIR - RED) / (NIR + RED)', bandMap).rename('NDVI');
+var ndwi = landsat8.expression('(GREEN - NIR) / (GREEN + NIR)', bandMap).rename('NDWI');
+
+// Calculate hazard scores based on vegetation and wetness
+var vegScore = ndvi.updateMask(distance.neq(0)).where(ndvi.gt(0.8), 1)
+  .where(ndvi.gt(0.6).and(ndvi.lte(0.8)), 2)
+  .where(ndvi.gt(0.4).and(ndvi.lte(0.6)), 3)
+  .where(ndvi.gt(0.2).and(ndvi.lte(0.4)), 4)
+  .where(ndvi.lte(0.2), 5);
+var wetScore = ndwi.updateMask(distance.neq(0)).where(ndwi.gt(0.6), 5)
+  .where(ndwi.gt(0.2).and(ndwi.lte(0.6)), 4)
+  .where(ndwi.gt(-0.2).and(ndwi.lte(0.2)), 3)
+  .where(ndwi.gt(-0.6).and(ndwi.lte(-0.2)), 2)
+  .where(ndwi.lte(-0.6), 1);
+
+// Calculate final flood hazard score
+var floodHazard = distanceScore.add(topoScore).add(vegScore).add(wetScore).add(elevScore).rename('Flood_hazard');
+var floodHazardScore = floodHazard.where(floodHazard.gt(15), 5)
+  .where(floodHazard.gt(10).and(floodHazard.lte(15)), 4)
+  .where(floodHazard.gt(5).and(floodHazard.lte(10)), 3)
+  .where(floodHazard.gt(0).and(floodHazard.lte(5)), 2)
+  .where(floodHazard.lte(0), 1);
+
+// Add flood hazard layers to the map
+Map.addLayer(floodHazard, { min: 1, max: 20, palette: rainbow }, 'Flood hazard');
+Map.addLayer(floodHazardScore, { min: 1, max: 5, palette: rainbow }, 'Flood hazard score');
+
+// Add legend panel
+var legendPanel = ui.Panel([
+  ui.Label('Flood hazard', { fontWeight: 'bold' }),
+  ui.Label('Legend:', { fontWeight: 'bold' }),
+]);
+var labels = [ 'Very low', 'Low', 'Medium', 'High', 'Very high' ];
+var values = [ 1, 2, 3, 4, 5 ];
+labels.map(function(label, index){
+  legendPanel.add(ui.Panel([
+    ui.Label('', { backgroundColor: rainbow[index], height: '20px', width: '20px', border: '1px solid black' }),
+    ui.Label(label, { height: '20px' }),
+  ], ui.Panel.Layout.flow('horizontal')));
+});
+Map.add(legendPanel);
+// Center the map on the Area of Interest (Aoi)
+Map.centerObject(roi);
